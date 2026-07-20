@@ -1372,16 +1372,19 @@ impl RawFile {
                 *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v as f64;
             }
         }
+        // Out-of-range / calibration-unreachable sim peaks are DROPPED (consistent with author_profile),
+        // not errored — an overlaid simulated survey legitimately spans past this scan's mass range.
         for &(mz, inten) in sim_peaks {
             if !inten.is_finite() || inten < 0.0 {
                 return Err(err("sim peak intensity must be finite and non-negative"));
             }
-            let f = calib
-                .freq(mz)
-                .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
+            let f = match calib.freq(mz) {
+                Some(f) => f,
+                None => continue, // unreachable by this calibration — drop
+            };
             let b = ((f - first_value) / step).round();
             if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
-                return Err(err("sim peak m/z falls outside the scan's frequency grid"));
+                continue; // outside the scan's frequency grid — drop
             }
             *acc.entry(b as u32).or_insert(0.0) += inten as f64;
         }
@@ -2188,18 +2191,23 @@ impl RawFile {
         };
         let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
 
-        // Bin peaks onto the existing grid; merge collisions (same as author_profile).
+        // Bin peaks onto the existing grid; merge collisions (same as author_profile). Out-of-range /
+        // calibration-unreachable peaks are DROPPED (consistent with author_profile) so the deferred
+        // over-budget repack path is robust to a broad simulated survey. NB: the per-scan drop tally is
+        // not surfaced here (this path returns only bytes+stats); a run-level tally for repacked scans is
+        // a follow-up. Degenerate inputs (non-finite / m/z<=0) remain hard errors.
         let mut binned: Vec<(u32, f32)> = Vec::with_capacity(peaks.len());
         for &(mz, inten) in peaks {
             if !mz.is_finite() || mz <= 0.0 || !inten.is_finite() || inten < 0.0 {
                 return Err(err("profile peak must have finite m/z>0 and finite intensity>=0"));
             }
-            let f = calib
-                .freq(mz)
-                .ok_or_else(|| err("peak m/z unreachable by this calibration"))?;
+            let f = match calib.freq(mz) {
+                Some(f) => f,
+                None => continue, // unreachable by this calibration — drop
+            };
             let bin = ((f - first_value) / step).round();
             if !bin.is_finite() || bin < 0.0 || bin >= nbins as f64 {
-                return Err(err("peak m/z falls outside the scan's frequency grid"));
+                continue; // outside the scan's frequency grid — drop
             }
             binned.push((bin as u32, inten));
         }
