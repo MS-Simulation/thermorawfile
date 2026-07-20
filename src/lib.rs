@@ -1141,6 +1141,9 @@ impl RawFile {
             if !mz.is_finite() {
                 return Err(err("non-finite peak m/z"));
             }
+            if !inten.is_finite() || inten < 0.0 {
+                return Err(err("peak intensity must be finite and non-negative"));
+            }
             let f = match calib.freq(mz) {
                 Some(f) => f,
                 None => {
@@ -2212,12 +2215,18 @@ impl RawFile {
             binned.push((bin as u32, inten));
         }
         binned.sort_by_key(|x| x.0);
+        // Merge collisions in f64 then clamp to the f32 ceiling (never wrap) — consistent with
+        // author_profile, so a deferred/over-budget scan encodes the same as an in-budget one.
         let mut chunks: Vec<(u32, f32)> = Vec::with_capacity(binned.len());
+        let mut acc: Vec<f64> = Vec::with_capacity(binned.len());
         for (bin, inten) in binned {
             match chunks.last_mut() {
-                Some(last) if last.0 == bin => last.1 += inten,
-                _ => chunks.push((bin, inten)),
+                Some(last) if last.0 == bin => *acc.last_mut().unwrap() += inten as f64,
+                _ => { chunks.push((bin, 0.0)); acc.push(inten as f64); }
             }
+        }
+        for (c, &sum) in chunks.iter_mut().zip(acc.iter()) {
+            c.1 = if sum > f32::MAX as f64 { f32::MAX } else { sum as f32 };
         }
 
         let k = chunks.len();
