@@ -414,6 +414,38 @@ pub fn is_over_budget(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::InvalidData && e.to_string() == OVER_BUDGET_MSG
 }
 
+/// Outcome of an `author_profile` / `overlay_profile` call: what was written and what was dropped.
+///
+/// A peak whose m/z falls outside the scan's frequency grid (or is unreachable by the calibration) is a
+/// peak the instrument could never have recorded on THIS scan — so it is **dropped**, not treated as an
+/// error, and accounted here. (Whole-call errors remain for degenerate inputs: a non-finite input m/z or
+/// a degenerate grid.) Callers that care about lost signal should inspect `dropped_intensity` — a peak
+/// COUNT can look harmless while a dominant precursor/isotope envelope was silently lost.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProfileWriteResult {
+    /// Distinct grid bins written (peaks landing on one bin are merged into it).
+    pub written_bins: usize,
+    /// Peaks dropped with a bin below the grid (bin < 0).
+    pub dropped_below_range: usize,
+    /// Peaks dropped with a bin at/above the grid (bin >= nbins).
+    pub dropped_above_range: usize,
+    /// Peaks dropped because the calibration had no valid frequency for that m/z.
+    pub dropped_unreachable: usize,
+    /// Total intensity of all dropped peaks (ion current lost).
+    pub dropped_intensity: f64,
+    /// Bins that received more than one peak (contributions summed).
+    pub merged_bins: usize,
+    /// Bins whose summed intensity was clamped to the `f32` ceiling (never wraps).
+    pub saturated_bins: usize,
+}
+
+impl ProfileWriteResult {
+    /// Total peaks dropped for any reason.
+    pub fn dropped_total(&self) -> usize {
+        self.dropped_below_range + self.dropped_above_range + self.dropped_unreachable
+    }
+}
+
 /// Width of a centroid peak record, selected per scan.
 ///
 /// Centroid record width in BYTES, from the EXACT peaklist-word equation.
@@ -1041,7 +1073,7 @@ impl RawFile {
         scan: u32,
         peaks: &[(f64, f32)],
         calib: &Calibration,
-    ) -> io::Result<()> {
+    ) -> io::Result<ProfileWriteResult> {
         if scan < self.first_scan || scan > self.last_scan {
             return Err(err("scan out of range"));
         }
@@ -1088,24 +1120,61 @@ impl RawFile {
             true // default to the 12-byte FTMS form if no native peaklist
         };
 
-        // Map each peak to its exact grid bin; merge peaks landing on the same bin.
+        // Map each peak to its exact grid bin. A peak the instrument could never have recorded on this
+        // scan (unreachable by the calibration, or a bin outside the grid) is DROPPED and accounted, not
+        // treated as a whole-call error — a simulated survey legitimately spans past a scan's mass range.
+        // A non-finite INPUT m/z is a caller bug and still a hard error.
+        let mut result = ProfileWriteResult::default();
         let mut binned: Vec<(u32, f32)> = Vec::with_capacity(peaks.len());
         for &(mz, inten) in peaks {
-            let f = calib
-                .freq(mz)
-                .ok_or_else(|| err("peak m/z unreachable by this calibration"))?;
+            if !mz.is_finite() {
+                return Err(err("non-finite peak m/z"));
+            }
+            let f = match calib.freq(mz) {
+                Some(f) => f,
+                None => {
+                    result.dropped_unreachable += 1;
+                    result.dropped_intensity += inten as f64;
+                    continue;
+                }
+            };
             let bin = ((f - first_value) / step).round();
-            if !bin.is_finite() || bin < 0.0 || bin >= nbins as f64 {
-                return Err(err("peak m/z falls outside the scan's frequency grid"));
+            if !bin.is_finite() || bin < 0.0 {
+                result.dropped_below_range += 1;
+                result.dropped_intensity += inten as f64;
+                continue;
+            }
+            if bin >= nbins as f64 {
+                result.dropped_above_range += 1;
+                result.dropped_intensity += inten as f64;
+                continue;
             }
             binned.push((bin as u32, inten));
         }
         binned.sort_by_key(|x| x.0);
+        // Merge peaks on the same bin, summing in f64 (an f32 running sum can lose or overflow), then
+        // clamp to the f32 ceiling — never wrap.
         let mut chunks: Vec<(u32, f32)> = Vec::with_capacity(binned.len());
+        let mut acc_f64: Vec<f64> = Vec::with_capacity(binned.len());
         for (bin, inten) in binned {
             match chunks.last_mut() {
-                Some(last) if last.0 == bin => last.1 += inten,
-                _ => chunks.push((bin, inten)),
+                Some(last) if last.0 == bin => {
+                    *acc_f64.last_mut().unwrap() += inten as f64;
+                    result.merged_bins += 1;
+                }
+                _ => {
+                    chunks.push((bin, 0.0));
+                    acc_f64.push(inten as f64);
+                }
+            }
+        }
+        // Finalise each bin's intensity from the f64 accumulator with saturation accounting.
+        for (c, &sum) in chunks.iter_mut().zip(acc_f64.iter()) {
+            if sum > f32::MAX as f64 {
+                c.1 = f32::MAX;
+                result.saturated_bins += 1;
+            } else {
+                c.1 = sum as f32;
             }
         }
 
@@ -1225,7 +1294,8 @@ impl RawFile {
             high_mz,
             ..entry
         };
-        Ok(())
+        result.written_bins = chunks.len();
+        Ok(result)
     }
 
     /// Overlay simulated peaks onto a scan's **existing** FTMS profile (real⊕sim).
