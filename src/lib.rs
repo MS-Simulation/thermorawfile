@@ -444,6 +444,17 @@ impl ProfileWriteResult {
     pub fn dropped_total(&self) -> usize {
         self.dropped_below_range + self.dropped_above_range + self.dropped_unreachable
     }
+
+    /// Fold another result into this one (for a run-level tally across many authored scans).
+    pub fn accumulate(&mut self, o: &ProfileWriteResult) {
+        self.written_bins += o.written_bins;
+        self.dropped_below_range += o.dropped_below_range;
+        self.dropped_above_range += o.dropped_above_range;
+        self.dropped_unreachable += o.dropped_unreachable;
+        self.dropped_intensity += o.dropped_intensity;
+        self.merged_bins += o.merged_bins;
+        self.saturated_bins += o.saturated_bins;
+    }
 }
 
 /// Width of a centroid peak record, selected per scan.
