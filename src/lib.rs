@@ -700,16 +700,23 @@ impl RawFile {
 
     /// Read the FTMS frequency↔m/z calibration from a scan-event byte offset.
     ///
-    /// rev66 MS1 scan-event layout (per OpenTFRaw §22 / unfinnigan, public-data RE):
-    /// `Nparam u32 @ +216`, then `A/B/C f64 @ +236 / +244 / +252`. Returns
+    /// rev66 MS1 scan-event layout (per OpenTFRaw §22 / unfinnigan, public-data RE): a
+    /// 136-byte preamble, then a body whose size depends on the instrument family. The
+    /// record is `Nparam u32`, then `A/B/C f64 @ +20 / +28 / +36` from it, at `+216` for the
+    /// 136/144-byte uniform bodies (Astral, Q Exactive, Exploris) and at `+160` for the
+    /// 96-byte primary body (Velos, Fusion, Fusion Lumos, Elite). Returns
     /// `None` if `nparam` is not a recognised value (4/5/7) — e.g. a non-MS1
     /// event. Locating the event offset for an arbitrary scan needs the
-    /// variable-length scan-event walk (MS1 events are longer than MS2); for
+    /// variable-length scan-event walk (MS1 and MS2 events differ in length on Fusion-class
+    /// files, e.g. 232 vs 288 bytes on a Fusion Lumos); for
     /// the first scan the offset is `scantrailer_addr + 4`.
     pub fn calibration_at_event(&self, event_offset: usize) -> Option<Calibration> {
         // The calibration record — nparam (u32) followed by a@+20, b@+28, c@+36 (f64) — sits
-        // at a revision-dependent offset within the trailer event: Astral at +216 (nparam=5),
-        // Exploris/Q-Exactive at +160 (nparam=7). Try those two KNOWN offsets first so an
+        // at a layout-dependent offset within the trailer event, right after the acquisition
+        // window: +216 (body+80) in 136/144-byte bodies — Astral, Q Exactive HF, Exploris —
+        // and +160 (body+24) in 96-byte primary bodies — Velos, Fusion Lumos (checked on
+        // PXD031322, see tests/lumos_calibration.rs; OpenTFRaw 6ec90a3 fixed the same layout).
+        // In every file checked only one of the two holds a record. Try those KNOWN offsets first so an
         // accidental earlier byte pattern can't mask the real record; only then fall back to
         // scanning the event for the first plausible record (handles unknown revisions).
         let base = event_offset;
