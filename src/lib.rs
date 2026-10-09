@@ -179,33 +179,36 @@ impl Calibration {
     /// no root yielding a positive, finite frequency.
     ///
     /// Solves `c·x² + b·x + (a − mz) = 0` where `x = 1/f` (nparam 4) or
-    /// `x = 1/f²` (nparam 5/7), handling the degenerate linear case (`c == 0`),
-    /// and selecting — among the candidate roots — the positive-frequency one
-    /// that maps back closest to the requested m/z.
+    /// `x = 1/f²` (nparam 5/7), handling the degenerate linear case (`c == 0`).
+    /// The quadratic has two roots and both map back onto `mz` to within rounding,
+    /// so round-trip error cannot tell them apart. The physical one is the root
+    /// nearest the first-order solution `x = (mz − a)/b`, where the `c` term is a
+    /// small correction (~1e-6 of the `b` term on real files); the other sits near
+    /// `x = −b/c`, a frequency of ~0.2 on Astral and Fusion Lumos calibrations,
+    /// far off any profile grid. Picking by round-trip error chose that root for
+    /// ~10% of in-range m/z values on those instruments.
     pub fn freq(&self, mz: f64) -> Option<f64> {
         if ![mz, self.a, self.b, self.c].iter().all(|v| v.is_finite()) {
             return None;
         }
         let d = self.a - mz; // c·x² + b·x + d = 0
+        if self.b == 0.0 && self.c == 0.0 {
+            return None;
+        }
         let xs: [Option<f64>; 2] = if self.c == 0.0 {
             // Linear: b·x + d = 0.
-            if self.b == 0.0 {
-                return None;
-            }
             [Some(-d / self.b), None]
         } else {
             let disc = self.b * self.b - 4.0 * self.c * d;
             if disc < 0.0 {
                 return None;
             }
-            let s = disc.sqrt();
-            [
-                Some((-self.b + s) / (2.0 * self.c)),
-                Some((-self.b - s) / (2.0 * self.c)),
-            ]
+            // Cancellation-free form: q = −(b + sign(b)·√disc)/2, roots q/c and d/q.
+            let q = -0.5 * (self.b + self.b.signum() * disc.sqrt());
+            [Some(q / self.c), (q != 0.0).then(|| d / q)]
         };
-        let mut best: Option<f64> = None;
-        let mut best_err = f64::INFINITY;
+        let first_order = if self.b != 0.0 { Some(-d / self.b) } else { None };
+        let mut best: Option<(f64, f64)> = None; // (distance from first order, f)
         for x in xs.into_iter().flatten() {
             if !x.is_finite() || x <= 0.0 {
                 continue; // need positive frequency
@@ -217,13 +220,16 @@ impl Calibration {
             if !f.is_finite() || f <= 0.0 {
                 continue;
             }
-            let err = (self.mz(f) - mz).abs();
-            if err < best_err {
-                best_err = err;
-                best = Some(f);
+            // Without a b term there is no first-order solution; fall back to round-trip error.
+            let key = match first_order {
+                Some(x0) => (x - x0).abs(),
+                None => (self.mz(f) - mz).abs(),
+            };
+            if best.map_or(true, |(k, _)| key < k) {
+                best = Some((key, f));
             }
         }
-        best
+        best.map(|(_, f)| f)
     }
 }
 
