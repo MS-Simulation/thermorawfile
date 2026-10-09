@@ -109,10 +109,11 @@ pub struct Peak {
 /// A decoded FTMS profile: a frequency grid plus contiguous signal chunks.
 ///
 /// The profile is stored as a sparse set of `chunks` over a uniform frequency
-/// grid (`first_value` + bin·`step`). Converting a bin to m/z needs the
-/// per-scan frequency→m/z calibration (not yet ported), so this struct exposes
-/// the grid verbatim — enough to rewrite intensities in place
-/// ([`RawFile::set_profile_intensities`]) on a template's real m/z grid.
+/// grid (`first_value` + bin·`step`). Converting a point to m/z needs the
+/// per-scan frequency→m/z [`Calibration`] plus its chunk's `fudge` (see
+/// [`Profile::points`]); the grid itself is exposed verbatim — enough to rewrite
+/// intensities in place ([`RawFile::set_profile_intensities`]) on a template's
+/// real m/z grid.
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub first_value: f64,
@@ -128,9 +129,27 @@ impl Profile {
         self.chunks.iter().map(|c| c.signal.len()).sum()
     }
 
-    /// m/z of a grid bin under `calib`.
+    /// m/z of a grid bin under `calib`, **without** a chunk's `fudge`. Exact for
+    /// profiles this crate authors (they store fudge 0); for an instrument-written
+    /// profile use [`Profile::points`], which adds each chunk's correction.
     pub fn mz_of_bin(&self, bin: u32, calib: &Calibration) -> f64 {
         calib.mz(self.first_value + bin as f64 * self.step)
+    }
+
+    /// Every stored point as `(m/z, intensity)`: the grid frequency converted under
+    /// `calib`, plus the chunk's `fudge`. The fudge is an additive m/z correction
+    /// applied after conversion, not a frequency offset (OpenTFRaw 420dcef). On real
+    /// Astral, Q Exactive HF and Fusion Lumos MS1 every chunk carries one, up to
+    /// ~2e-2 m/z; with it, parabolic profile apexes land on the stored centroids to
+    /// within ~3e-6 m/z on average, against up to 2.6e-4 without it.
+    pub fn points(&self, calib: &Calibration) -> Vec<(f64, f32)> {
+        let mut out = Vec::with_capacity(self.point_count());
+        for ch in &self.chunks {
+            for (j, &v) in ch.signal.iter().enumerate() {
+                out.push((self.mz_of_bin(ch.first_bin + j as u32, calib) + ch.fudge as f64, v));
+            }
+        }
+        out
     }
 
     /// Nearest grid bin for a target m/z under `calib` (rounded), or `None` if
@@ -145,6 +164,8 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub struct ProfileChunk {
     pub first_bin: u32,
+    /// Additive m/z correction for every point in this chunk, applied after the
+    /// frequency→m/z conversion. 0 when the packet layout has no fudge field.
     pub fudge: f32,
     pub signal: Vec<f32>,
 }
@@ -1236,6 +1257,11 @@ impl RawFile {
     /// (offset + DataPacketSize unchanged, slack zeroed). The real analyte+noise
     /// signal is **retained**, so a peptide the simulation also generates can
     /// appear twice — this is real+sim, not a noise-only background.
+    ///
+    /// Each real chunk keeps its `fudge` (its m/z correction), so the real signal
+    /// does not move. A sim peak that lands in or next to a real chunk joins it and
+    /// is placed on the grid for `mz − fudge`, so it still reads back at `mz`; a sim
+    /// peak away from real signal gets its own chunk with fudge 0.
     pub fn overlay_profile(
         &mut self,
         scan: u32,
@@ -1284,43 +1310,68 @@ impl RawFile {
         // Accumulate the real signal per bin in f64 (lossless for f32 reals and
         // avoids losing small simulated contributions beside large real ones),
         // then add the simulated peaks.
+        // Each bin also carries the fudge of the chunk it will be written in.
         use std::collections::BTreeMap;
-        let mut acc: BTreeMap<u32, f64> = BTreeMap::new();
+        let mut acc: BTreeMap<u32, (f64, f32)> = BTreeMap::new();
         for ch in &prof.chunks {
             for (j, &v) in ch.signal.iter().enumerate() {
-                *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v as f64;
+                acc.entry(ch.first_bin + j as u32).or_insert((0.0, ch.fudge)).0 += v as f64;
             }
         }
+        // The real chunk whose bins, or the bin on either side, include `b`.
+        let real_fudge_near = |b: f64| -> Option<f32> {
+            prof.chunks.iter().find_map(|ch| {
+                let lo = ch.first_bin as f64 - 1.0;
+                let hi = (ch.first_bin as f64) + ch.signal.len() as f64;
+                (lo <= b && b <= hi).then_some(ch.fudge)
+            })
+        };
         for &(mz, inten) in sim_peaks {
             if !inten.is_finite() || inten < 0.0 {
                 return Err(err("sim peak intensity must be finite and non-negative"));
             }
-            let f = calib
-                .freq(mz)
-                .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
-            let b = ((f - first_value) / step).round();
-            if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
-                return Err(err("sim peak m/z falls outside the scan's frequency grid"));
+            let bin_of = |mz: f64| -> io::Result<f64> {
+                let f = calib
+                    .freq(mz)
+                    .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
+                let b = ((f - first_value) / step).round();
+                if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
+                    return Err(err("sim peak m/z falls outside the scan's frequency grid"));
+                }
+                Ok(b)
+            };
+            let mut b = bin_of(mz)?;
+            let mut fudge = 0.0f32;
+            if let Some(rf) = real_fudge_near(b) {
+                if rf != 0.0 {
+                    b = bin_of(mz - rf as f64)?;
+                }
+                fudge = rf;
             }
-            *acc.entry(b as u32).or_insert(0.0) += inten as f64;
+            acc.entry(b as u32).or_insert((0.0, fudge)).0 += inten as f64;
         }
 
         // Build contiguous chunks; convert accumulated f64 → f32 (the stored
         // signal type), rejecting any overflow to non-finite.
+        // A new chunk starts at a gap or where the fudge changes.
         struct Ck {
             first_bin: u32,
+            fudge: f32,
             signal: Vec<f32>,
         }
         let mut chunks: Vec<Ck> = Vec::new();
-        for (bin, vf) in acc {
+        for (bin, (vf, fudge)) in acc {
             let v = vf as f32;
             if !v.is_finite() {
                 return Err(err("accumulated profile intensity overflowed to non-finite"));
             }
             match chunks.last_mut() {
-                Some(c) if c.first_bin + c.signal.len() as u32 == bin => c.signal.push(v),
+                Some(c) if c.first_bin + c.signal.len() as u32 == bin && c.fudge == fudge => {
+                    c.signal.push(v)
+                }
                 _ => chunks.push(Ck {
                     first_bin: bin,
+                    fudge,
                     signal: vec![v],
                 }),
             }
@@ -1358,7 +1409,7 @@ impl RawFile {
             for (j, &v) in c.signal.iter().enumerate() {
                 tic += v as f64;
                 let bin = c.first_bin + j as u32;
-                let mz = calib.mz(first_value + bin as f64 * step);
+                let mz = calib.mz(first_value + bin as f64 * step) + c.fudge as f64;
                 low_mz = low_mz.min(mz);
                 high_mz = high_mz.max(mz);
                 if v as f64 > base_int {
@@ -1370,7 +1421,10 @@ impl RawFile {
                     apex_bin = bin;
                 }
             }
-            centroids.push((calib.mz(first_value + apex_bin as f64 * step), apex_v));
+            centroids.push((
+                calib.mz(first_value + apex_bin as f64 * step) + c.fudge as f64,
+                apex_v,
+            ));
         }
         if chunks.is_empty() {
             low_mz = 0.0;
@@ -1400,7 +1454,7 @@ impl RawFile {
             put_u32(&mut self.bytes, o + 4, c.signal.len() as u32);
             o += 8;
             if layout > 0 {
-                put_f32(&mut self.bytes, o, 0.0);
+                put_f32(&mut self.bytes, o, c.fudge);
                 o += 4;
             }
             for &v in &c.signal {
