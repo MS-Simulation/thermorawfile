@@ -1454,23 +1454,30 @@ impl RawFile {
                 continue; // unreachable by this calibration — drop
             };
             let mut fudge = 0.0f32;
+            let mut reachable = true;
             for _ in 0..4 {
                 let next = real_fudge_at(b).unwrap_or(0.0);
                 if next == fudge {
                     break;
                 }
                 fudge = next;
-                let Some(nb) = bin_of(mz - fudge as f64) else {
-                    break;
-                };
-                b = nb;
+                match bin_of(mz - fudge as f64) {
+                    Some(nb) => b = nb,
+                    None => {
+                        reachable = false;
+                        break;
+                    }
+                }
+            }
+            // Drop, like an off-grid peak, rather than write it at an m/z off by a fudge: the
+            // shifted m/z was unreachable, or placement never settled (the bin's chunk has a
+            // different fudge than the one the bin was computed with).
+            if !reachable || real_fudge_at(b).unwrap_or(0.0) != fudge {
+                continue;
             }
             if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
                 continue; // outside the scan's frequency grid — drop
             }
-            // Always the fudge of the chunk the bin is written in, even if the loop did not
-            // settle, so a bin never carries two fudges.
-            let fudge = real_fudge_at(b).unwrap_or(0.0);
             acc.entry(b as u32).or_insert((0.0, fudge)).0 += inten as f64;
         }
 
