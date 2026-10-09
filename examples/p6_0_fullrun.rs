@@ -41,7 +41,7 @@ fn main() {
         orig.push((ev.ms_order, ev.analyzer, is_profile));
         let res = if ev.ms_order == 1 && is_profile {
             ms1_authored += 1;
-            rf.author_profile(scan, MS1_PROFILE, &calib)
+            rf.author_profile(scan, MS1_PROFILE, &calib).map(|_| ())
         } else {
             ms2_authored += 1;
             rf.author_centroids(scan, MS2_CENTROIDS)
