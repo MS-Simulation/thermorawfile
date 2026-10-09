@@ -10,8 +10,8 @@
 //!
 //! The scan event stores the frequency→m/z calibration; the per-scan trailer stores the
 //! same coefficients as "Conversion Parameter A/B/C". The two are written independently
-//! by the instrument, so agreement on every MS1 scan checks that the event offset we read
-//! the calibration from is the right one for this layout (OpenTFRaw 6ec90a3).
+//! by the instrument, so agreement on every MS1 scan, with the record found at event+160,
+//! checks that offset for this layout (OpenTFRaw 6ec90a3).
 
 use thermorawfile::RawFile;
 
@@ -30,6 +30,11 @@ fn lumos_ms1_calibration_matches_scan_trailers() {
         }
         ms1 += 1;
         let off = rf.scan_event_byte_offset(scan).unwrap();
+        // The record must sit at the 96-byte-body offset itself, not be found by the
+        // fallback scan: nparam 7 at event+160, and the +216 slot not a record at all.
+        let u32at = |o: usize| u32::from_le_bytes(rf.bytes[o..o + 4].try_into().unwrap());
+        assert_eq!(u32at(off + 160), 7, "scan {scan}: no nparam at event+160");
+        assert!(!matches!(u32at(off + 216), 4 | 5 | 7), "scan {scan}: +216 also looks like a record");
         let cal = rf.calibration_at_event(off);
         let params = rf.scan_params(scan).expect("scan trailer");
         let rec = params.record();
