@@ -1,9 +1,10 @@
 [package]
 name = "thermorawfile"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Pure-Rust reader (and, soon, writer) for Thermo Finnigan .raw files — no .NET/DLL"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/MS-Simulation/thermorawfile"
 
 [[bin]]
 name = "rawdump"
