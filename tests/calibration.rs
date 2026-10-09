@@ -68,3 +68,13 @@ fn fusion_lumos_picks_physical_root() {
     let cal = Calibration { nparam: 7, a: 0.0, b: 211782331.2992454, c: -270234696.3002101 };
     assert_physical_root(cal, 350.0, 1000.0);
 }
+
+#[test]
+fn extreme_coefficients_do_not_return_a_bogus_root() {
+    // Codex review: with unscaled coefficients the discriminant underflowed and freq
+    // returned ~0.7071, which maps to 6e-200, not 1e-200.
+    let cal = Calibration { nparam: 5, a: 0.0, b: 1e-200, c: 1e-200 };
+    if let Some(f) = cal.freq(1e-200) {
+        assert!((cal.mz(f) - 1e-200).abs() <= 1e-206, "f {f} maps to {}", cal.mz(f));
+    }
+}
