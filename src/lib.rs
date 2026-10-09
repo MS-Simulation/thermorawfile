@@ -140,8 +140,9 @@ impl Profile {
     /// `calib`, plus the chunk's `fudge`. The fudge is an additive m/z correction
     /// applied after conversion, not a frequency offset (OpenTFRaw 420dcef). On real
     /// Astral, Q Exactive HF and Fusion Lumos MS1 every chunk carries one, up to
-    /// ~2e-2 m/z; with it, parabolic profile apexes land on the stored centroids to
-    /// within ~3e-6 m/z on average, against up to 2.6e-4 without it.
+    /// ~2e-2 m/z. With it, the mean signed offset of parabolic profile apexes from the
+    /// stored centroids drops to ≤3e-6 m/z (from up to 2.6e-4 without it), and the mean
+    /// absolute offset to ≤1.3e-4 (from up to 7.6e-4).
     pub fn points(&self, calib: &Calibration) -> Vec<(f64, f32)> {
         let mut out = Vec::with_capacity(self.point_count());
         for ch in &self.chunks {
@@ -1318,36 +1319,47 @@ impl RawFile {
                 acc.entry(ch.first_bin + j as u32).or_insert((0.0, ch.fudge)).0 += v as f64;
             }
         }
-        // The real chunk whose bins, or the bin on either side, include `b`.
-        let real_fudge_near = |b: f64| -> Option<f32> {
-            prof.chunks.iter().find_map(|ch| {
-                let lo = ch.first_bin as f64 - 1.0;
-                let hi = (ch.first_bin as f64) + ch.signal.len() as f64;
-                (lo <= b && b <= hi).then_some(ch.fudge)
-            })
+        // The fudge of the real chunk that holds bin `b`, else of one it borders (a sim peak
+        // there joins that chunk). Containment wins over adjacency.
+        let real_fudge_at = |b: f64| -> Option<f32> {
+            let span = |ch: &ProfileChunk| (ch.first_bin as f64, (ch.first_bin as f64) + ch.signal.len() as f64);
+            prof.chunks
+                .iter()
+                .find(|ch| { let (lo, hi) = span(ch); lo <= b && b < hi })
+                .or_else(|| prof.chunks.iter().find(|ch| { let (lo, hi) = span(ch); b == lo - 1.0 || b == hi }))
+                .map(|ch| ch.fudge)
         };
         for &(mz, inten) in sim_peaks {
             if !inten.is_finite() || inten < 0.0 {
                 return Err(err("sim peak intensity must be finite and non-negative"));
             }
+            // Unbounded: the range check waits until the fudge has been applied, since it
+            // can move an edge peak onto the grid.
             let bin_of = |mz: f64| -> io::Result<f64> {
                 let f = calib
                     .freq(mz)
                     .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
-                let b = ((f - first_value) / step).round();
-                if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
-                    return Err(err("sim peak m/z falls outside the scan's frequency grid"));
-                }
-                Ok(b)
+                Ok(((f - first_value) / step).round())
             };
-            let mut b = bin_of(mz)?;
+            // The chunk a peak lands in decides its fudge, and the fudge decides where it
+            // lands: iterate until they agree. One step suffices unless the shift crosses into
+            // a chunk with a different fudge; the bound stops a two-chunk oscillation.
             let mut fudge = 0.0f32;
-            if let Some(rf) = real_fudge_near(b) {
-                if rf != 0.0 {
-                    b = bin_of(mz - rf as f64)?;
+            let mut b = bin_of(mz)?;
+            for _ in 0..4 {
+                let next = real_fudge_at(b).unwrap_or(0.0);
+                if next == fudge {
+                    break;
                 }
-                fudge = rf;
+                fudge = next;
+                b = bin_of(mz - fudge as f64)?;
             }
+            if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
+                return Err(err("sim peak m/z falls outside the scan's frequency grid"));
+            }
+            // Always the fudge of the chunk the bin is written in, even if the loop did not
+            // settle, so a bin never carries two fudges.
+            let fudge = real_fudge_at(b).unwrap_or(0.0);
             acc.entry(b as u32).or_insert((0.0, fudge)).0 += inten as f64;
         }
 

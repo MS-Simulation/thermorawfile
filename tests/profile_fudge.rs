@@ -155,3 +155,53 @@ fn overlay_sim_peak_reads_back_at_its_mz() {
     assert_eq!(fudge_at(edge), Some(ch.fudge));
     assert_eq!(fudge_at(alone_bin), Some(0.0));
 }
+
+/// Byte offset of chunk `k`'s fudge field in `scan`'s profile packet (layout > 0).
+fn fudge_offset(rf: &RawFile, scan: u32, k: usize) -> usize {
+    let e = &rf.index[(scan - rf.first_scan) as usize];
+    let pkt = (rf.data_addr + e.offset) as usize;
+    let u = |o: usize| u32::from_le_bytes(rf.bytes[o..o + 4].try_into().unwrap());
+    assert!(u(pkt + 12) > 0, "packet layout has no fudge field");
+    let mut o = pkt + 40 + 24; // first_value, step, peak_count, nbins
+    for _ in 0..k {
+        let n = u(o + 4) as usize;
+        o += 12 + 4 * n; // first_bin, count, fudge, signal
+    }
+    o + 8
+}
+
+#[test]
+fn overlay_places_sim_peak_by_its_chunks_fudge() {
+    // small2's real fudges are under a fifth of a bin, too small for a misplacement to
+    // show. Give one long chunk a fudge of three bins, then spike a sim peak at the m/z
+    // of one of its own points: placed for mz − fudge it lands on that point's bin;
+    // placed without the fudge it lands three bins over and reads back 3 bins off.
+    let mut rf = RawFile::open(DATA).unwrap();
+    let scan = ms1_scans(&rf)[0];
+    let cal = calibration(&rf, scan);
+    let prof = rf.profile(scan).unwrap();
+    let (k, ch) = prof.chunks.iter().enumerate().find(|(_, c)| c.signal.len() >= 12).unwrap();
+    let mid = ch.first_bin + ch.signal.len() as u32 / 2;
+    let bin_width = (prof.mz_of_bin(mid + 1, &cal) - prof.mz_of_bin(mid, &cal)).abs();
+    let fudge = (3.0 * bin_width) as f32;
+    let o = fudge_offset(&rf, scan, k);
+    rf.bytes[o..o + 4].copy_from_slice(&fudge.to_le_bytes());
+    assert_eq!(rf.profile(scan).unwrap().chunks[k].fudge, fudge);
+
+    let target = prof.mz_of_bin(mid, &cal) + fudge as f64;
+    let sentinel = 7.5e6f32;
+    rf.overlay_profile(scan, &[(target, sentinel)], &cal).unwrap();
+    let after = rf.profile(scan).unwrap();
+    let (mz, _) = after
+        .points(&cal)
+        .into_iter()
+        .find(|p| p.1 >= sentinel)
+        .expect("sim peak written");
+    assert!((mz - target).abs() < 0.5 * bin_width, "sim peak at {target} read back at {mz}");
+    let holder = after
+        .chunks
+        .iter()
+        .find(|c| c.first_bin <= mid && mid < c.first_bin + c.signal.len() as u32)
+        .unwrap();
+    assert_eq!(holder.fudge, fudge);
+}
