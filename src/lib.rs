@@ -2401,7 +2401,8 @@ impl RawFile {
         if ms_power >= 2 {
             // Code 4 is a beam-type collision on the Orbitrap of Fusion/Exploris/Eclipse-class
             // instruments (the trailer calls it "HCD Energy"), so it renders as "hcd" on FTMS
-            // and "cid" only on the ion trap — per OpenTFRaw's `activation_str`.
+            // and "cid" on every other analyzer (the ion trap in practice) — per OpenTFRaw's
+            // `activation_str`.
             let act = match byte(24)? {
                 1 => "hcd",
                 4 if analyzer == "FTMS" => "hcd",
